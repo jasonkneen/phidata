@@ -6,7 +6,7 @@ from agno.storage.session import Session
 from agno.storage.session.agent import AgentSession
 from agno.storage.session.team import TeamSession
 from agno.storage.session.workflow import WorkflowSession
-from agno.utils.log import log_debug, log_info, logger
+from agno.utils.log import log_debug, log_info, log_warning, logger
 
 try:
     from sqlalchemy.dialects import mysql
@@ -67,6 +67,7 @@ class SingleStoreStorage(Storage):
         self.schema_version: int = schema_version
         # Automatically upgrade schema if True
         self.auto_upgrade_schema: bool = auto_upgrade_schema
+        self._schema_up_to_date: bool = False
 
         # Database session
         self.SqlSession: sessionmaker[SqlSession] = sessionmaker(bind=self.db_engine)
@@ -96,18 +97,20 @@ class SingleStoreStorage(Storage):
             Column("updated_at", mysql.BIGINT),
         ]
 
+        specific_columns = []
         if self.mode == "agent":
             specific_columns = [
                 Column("agent_id", mysql.TEXT),
-                Column("team_id", mysql.TEXT, nullable=True),
+                Column("team_session_id", mysql.TEXT, nullable=True),
                 Column("agent_data", mysql.JSON),
             ]
         elif self.mode == "team":
             specific_columns = [
                 Column("team_id", mysql.TEXT),
+                Column("team_session_id", mysql.TEXT, nullable=True),
                 Column("team_data", mysql.JSON),
             ]
-        else:
+        elif self.mode == "workflow":
             specific_columns = [
                 Column("workflow_id", mysql.TEXT),
                 Column("workflow_data", mysql.JSON),
@@ -142,7 +145,7 @@ class SingleStoreStorage(Storage):
     def create(self) -> None:
         self.table = self.get_table()
         if not self.table_exists():
-            log_info(f"\nCreating table: {self.table_name}\n")
+            log_info(f"Creating table: {self.table_name}\n")
             self.table.create(self.db_engine)
 
     def _read(self, session: SqlSession, session_id: str, user_id: Optional[str] = None) -> Optional[Row[Any]]:
@@ -166,7 +169,7 @@ class SingleStoreStorage(Storage):
                     return AgentSession.from_dict(existing_row._mapping)  # type: ignore
                 elif self.mode == "team":
                     return TeamSession.from_dict(existing_row._mapping)  # type: ignore
-                else:
+                elif self.mode == "workflow":
                     return WorkflowSession.from_dict(existing_row._mapping)  # type: ignore
             return None
 
@@ -183,7 +186,7 @@ class SingleStoreStorage(Storage):
                         stmt = stmt.where(self.table.c.agent_id == entity_id)
                     elif self.mode == "team":
                         stmt = stmt.where(self.table.c.team_id == entity_id)
-                    else:
+                    elif self.mode == "workflow":
                         stmt = stmt.where(self.table.c.workflow_id == entity_id)
                 # order by created_at desc
                 stmt = stmt.order_by(self.table.c.created_at.desc())
@@ -209,7 +212,7 @@ class SingleStoreStorage(Storage):
                         stmt = stmt.where(self.table.c.agent_id == entity_id)
                     elif self.mode == "team":
                         stmt = stmt.where(self.table.c.team_id == entity_id)
-                    else:
+                    elif self.mode == "workflow":
                         stmt = stmt.where(self.table.c.workflow_id == entity_id)
                 # order by created_at desc
                 stmt = stmt.order_by(self.table.c.created_at.desc())
@@ -225,7 +228,7 @@ class SingleStoreStorage(Storage):
                             _team_session = TeamSession.from_dict(row._mapping)  # type: ignore
                             if _team_session is not None:
                                 sessions.append(_team_session)
-                        else:
+                        elif self.mode == "workflow":
                             _workflow_session = WorkflowSession.from_dict(row._mapping)  # type: ignore
                             if _workflow_session is not None:
                                 sessions.append(_workflow_session)
@@ -236,7 +239,7 @@ class SingleStoreStorage(Storage):
     def upgrade_schema(self) -> None:
         """
         Upgrade the schema to the latest version.
-        Currently handles adding the team_id column for agent mode.
+        Currently handles adding the team_session_id column for agent mode.
         """
         if not self.auto_upgrade_schema:
             log_debug("Auto schema upgrade disabled. Skipping upgrade.")
@@ -245,12 +248,12 @@ class SingleStoreStorage(Storage):
         try:
             if self.mode == "agent" and self.table_exists():
                 with self.SqlSession() as sess:
-                    # Check if team_id column exists
+                    # Check if team_session_id column exists
                     column_exists_query = text(
                         """
                         SELECT 1 FROM information_schema.columns
                         WHERE table_schema = :schema AND table_name = :table
-                        AND column_name = 'team_id'
+                        AND column_name = 'team_session_id'
                         """
                     )
                     column_exists = (
@@ -259,10 +262,13 @@ class SingleStoreStorage(Storage):
                     )
 
                     if not column_exists:
-                        log_info(f"Adding 'team_id' column to {self.schema}.{self.table_name}")
-                        alter_table_query = text(f"ALTER TABLE {self.schema}.{self.table_name} ADD COLUMN team_id TEXT")
+                        log_info(f"Adding 'team_session_id' column to {self.schema}.{self.table_name}")
+                        alter_table_query = text(
+                            f"ALTER TABLE {self.schema}.{self.table_name} ADD COLUMN team_session_id TEXT"
+                        )
                         sess.execute(alter_table_query)
                         sess.commit()
+                        self._schema_up_to_date = True
                         log_info("Schema upgrade completed successfully")
         except Exception as e:
             logger.error(f"Error during schema upgrade: {e}")
@@ -273,7 +279,7 @@ class SingleStoreStorage(Storage):
         Create a new session if it does not exist, otherwise update the existing session.
         """
         # Perform schema upgrade if auto_upgrade_schema is enabled
-        if self.auto_upgrade_schema:
+        if self.auto_upgrade_schema and not self._schema_up_to_date:
             self.upgrade_schema()
 
         with self.SqlSession.begin() as sess:
@@ -282,12 +288,12 @@ class SingleStoreStorage(Storage):
                 upsert_sql = text(
                     f"""
                     INSERT INTO {self.schema}.{self.table_name}
-                    (session_id, agent_id, team_id, user_id, memory, agent_data, session_data, extra_data, created_at, updated_at)
+                    (session_id, agent_id, team_session_id, user_id, memory, agent_data, session_data, extra_data, created_at, updated_at)
                     VALUES
-                    (:session_id, :agent_id, :team_id, :user_id, :memory, :agent_data, :session_data, :extra_data, UNIX_TIMESTAMP(), NULL)
+                    (:session_id, :agent_id, :team_session_id, :user_id, :memory, :agent_data, :session_data, :extra_data, UNIX_TIMESTAMP(), NULL)
                     ON DUPLICATE KEY UPDATE
                         agent_id = VALUES(agent_id),
-                        team_id = VALUES(team_id),
+                        team_session_id = VALUES(team_session_id),
                         user_id = VALUES(user_id),
                         memory = VALUES(memory),
                         agent_data = VALUES(agent_data),
@@ -300,11 +306,12 @@ class SingleStoreStorage(Storage):
                 upsert_sql = text(
                     f"""
                     INSERT INTO {self.schema}.{self.table_name}
-                    (session_id, team_id, user_id, memory, team_data, session_data, extra_data, created_at, updated_at)
+                    (session_id, team_id, user_id, team_session_id, memory, team_data, session_data, extra_data, created_at, updated_at)
                     VALUES
-                    (:session_id, :team_id, :user_id, :memory, :team_data, :session_data, :extra_data, UNIX_TIMESTAMP(), NULL)
+                    (:session_id, :team_id, :user_id, :team_session_id, :memory, :team_data, :session_data, :extra_data, UNIX_TIMESTAMP(), NULL)
                     ON DUPLICATE KEY UPDATE
                         team_id = VALUES(team_id),
+                        team_session_id = VALUES(team_session_id),
                         user_id = VALUES(user_id),
                         memory = VALUES(memory),
                         team_data = VALUES(team_data),
@@ -313,7 +320,7 @@ class SingleStoreStorage(Storage):
                         updated_at = UNIX_TIMESTAMP();
                     """
                 )
-            else:
+            elif self.mode == "workflow":
                 upsert_sql = text(
                     f"""
                     INSERT INTO {self.schema}.{self.table_name}
@@ -338,7 +345,7 @@ class SingleStoreStorage(Storage):
                         {
                             "session_id": session.session_id,
                             "agent_id": session.agent_id,  # type: ignore
-                            "team_id": session.team_id,  # type: ignore
+                            "team_session_id": session.team_session_id,  # type: ignore
                             "user_id": session.user_id,
                             "memory": json.dumps(session.memory, ensure_ascii=False)
                             if session.memory is not None
@@ -361,6 +368,7 @@ class SingleStoreStorage(Storage):
                             "session_id": session.session_id,
                             "team_id": session.team_id,  # type: ignore
                             "user_id": session.user_id,
+                            "team_session_id": session.team_session_id,  # type: ignore
                             "memory": json.dumps(session.memory, ensure_ascii=False)
                             if session.memory is not None
                             else None,
@@ -375,7 +383,7 @@ class SingleStoreStorage(Storage):
                             else None,
                         },
                     )
-                else:
+                elif self.mode == "workflow":
                     sess.execute(
                         upsert_sql,
                         {
@@ -396,73 +404,19 @@ class SingleStoreStorage(Storage):
                             else None,
                         },
                     )
-            except Exception:
+            except Exception as e:
                 # Create table and try again
-                self.create()
-                if self.mode == "agent":
-                    sess.execute(
-                        upsert_sql,
-                        {
-                            "session_id": session.session_id,
-                            "agent_id": session.agent_id,  # type: ignore
-                            "team_id": session.team_id,  # type: ignore
-                            "user_id": session.user_id,
-                            "memory": json.dumps(session.memory, ensure_ascii=False)
-                            if session.memory is not None
-                            else None,
-                            "agent_data": json.dumps(session.agent_data, ensure_ascii=False)  # type: ignore
-                            if session.agent_data is not None  # type: ignore
-                            else None,
-                            "session_data": json.dumps(session.session_data, ensure_ascii=False)
-                            if session.session_data is not None
-                            else None,
-                            "extra_data": json.dumps(session.extra_data, ensure_ascii=False)
-                            if session.extra_data is not None
-                            else None,
-                        },
-                    )
-                elif self.mode == "team":
-                    sess.execute(
-                        upsert_sql,
-                        {
-                            "session_id": session.session_id,
-                            "team_id": session.team_id,  # type: ignore
-                            "user_id": session.user_id,
-                            "memory": json.dumps(session.memory, ensure_ascii=False)
-                            if session.memory is not None
-                            else None,
-                            "team_data": json.dumps(session.team_data, ensure_ascii=False)  # type: ignore
-                            if session.team_data is not None  # type: ignore
-                            else None,
-                            "session_data": json.dumps(session.session_data, ensure_ascii=False)
-                            if session.session_data is not None
-                            else None,
-                            "extra_data": json.dumps(session.extra_data, ensure_ascii=False)
-                            if session.extra_data is not None
-                            else None,
-                        },
-                    )
+                if not self.table_exists():
+                    log_debug(f"Table does not exist: {self.table.name}")
+                    log_debug("Creating table and retrying upsert")
+                    self.create()
+                    return self.upsert(session)
                 else:
-                    sess.execute(
-                        upsert_sql,
-                        {
-                            "session_id": session.session_id,
-                            "workflow_id": session.workflow_id,  # type: ignore
-                            "user_id": session.user_id,
-                            "memory": json.dumps(session.memory, ensure_ascii=False)
-                            if session.memory is not None
-                            else None,
-                            "workflow_data": json.dumps(session.workflow_data, ensure_ascii=False)  # type: ignore
-                            if session.workflow_data is not None  # type: ignore
-                            else None,
-                            "session_data": json.dumps(session.session_data, ensure_ascii=False)
-                            if session.session_data is not None
-                            else None,
-                            "extra_data": json.dumps(session.extra_data, ensure_ascii=False)
-                            if session.extra_data is not None
-                            else None,
-                        },
+                    log_warning(f"Exception upserting into table: {e}")
+                    log_warning(
+                        "A table upgrade might be required, please review these docs for more information: https://agno.link/upgrade-schema"
                     )
+                    return None
         return self.read(session_id=session.session_id)
 
     def delete_session(self, session_id: Optional[str] = None):
@@ -511,7 +465,7 @@ class SingleStoreStorage(Storage):
             if k in {"metadata", "table"}:
                 continue
             # Reuse db_engine and Session without copying
-            elif k in {"db_engine", "Session"}:
+            elif k in {"db_engine", "SqlSession"}:
                 setattr(copied_obj, k, v)
             else:
                 setattr(copied_obj, k, deepcopy(v, memo))

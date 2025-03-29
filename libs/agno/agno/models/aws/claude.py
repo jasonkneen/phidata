@@ -39,10 +39,30 @@ def _format_image_for_message(image: Image) -> Optional[Dict[str, Any]]:
     """
     Add an image to a message by converting it to base64 encoded format.
     """
-    import base64
-    import imghdr
+    using_filetype = False
 
-    type_mapping = {"jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+    import base64
+
+    # 'imghdr' was deprecated in Python 3.11: https://docs.python.org/3/library/imghdr.html
+    # 'filetype' used as a fallback
+    try:
+        import imghdr
+    except (ModuleNotFoundError, ImportError):
+        try:
+            import filetype
+
+            using_filetype = True
+        except (ModuleNotFoundError, ImportError):
+            raise ImportError("`filetype` not installed. Please install using `pip install filetype`")
+
+    type_mapping = {
+        "jpeg": "image/jpeg",
+        "jpg": "image/jpeg",
+        "png": "image/png",
+        "gif": "image/gif",
+        "webp": "image/webp",
+    }
+
     try:
         # Case 1: Image is a URL
         if image.url is not None:
@@ -68,7 +88,16 @@ def _format_image_for_message(image: Image) -> Optional[Dict[str, Any]]:
             log_error(f"Unsupported image type: {type(image)}")
             return None
 
-        img_type = imghdr.what(None, h=content_bytes)  # type: ignore
+        if using_filetype:
+            kind = filetype.guess(content_bytes)
+            if not kind:
+                log_error("Unable to determine image type")
+                return None
+
+            img_type = kind.extension
+        else:
+            img_type = imghdr.what(None, h=content_bytes)  # type: ignore
+
         if not img_type:
             log_error("Unable to determine image type")
             return None
@@ -122,13 +151,13 @@ def _format_messages(messages: List[Message]) -> Tuple[List[Dict[str, str]], str
                     if image_content:
                         content.append(image_content)
 
-            if message.files is not None:
+            if message.files is not None and len(message.files) > 0:
                 log_warning("Files are not supported for AWS Bedrock Claude")
 
-            if message.audio is not None:
+            if message.audio is not None and len(message.audio) > 0:
                 log_warning("Audio is not supported for AWS Bedrock Claude")
 
-            if message.videos is not None:
+            if message.videos is not None and len(message.videos) > 0:
                 log_warning("Video is not supported for AWS Bedrock Claude")
 
         # Handle tool calls from history
