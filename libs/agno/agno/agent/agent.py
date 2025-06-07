@@ -128,7 +128,7 @@ class Agent:
     # Signature:
     # def retriever(agent: Agent, query: str, num_documents: Optional[int], **kwargs) -> Optional[list[dict]]:
     #     ...
-    retriever: Optional[Callable[..., Optional[List[Dict]]]] = None
+    retriever: Optional[Callable[..., Optional[List[Union[Dict, str]]]]] = None
     references_format: Literal["json", "yaml"] = "json"
 
     # --- Agent Storage ---
@@ -200,6 +200,9 @@ class Agent:
     # If True, add the current datetime to the instructions to give the agent a sense of time
     # This allows for relative times like "tomorrow" to be used in the prompt
     add_datetime_to_instructions: bool = False
+    # If True, add the current location to the instructions to give the agent a sense of place
+    # This allows for location-aware responses and local context
+    add_location_to_instructions: bool = False
     # Allows for custom timezone for datetime instructions following the TZ Database format (e.g. "Etc/UTC")
     timezone_identifier: Optional[str] = None
     # If True, add the session state variables in the user and system messages
@@ -319,7 +322,7 @@ class Agent:
         knowledge_filters: Optional[Dict[str, Any]] = None,
         enable_agentic_knowledge_filters: Optional[bool] = None,
         add_references: bool = False,
-        retriever: Optional[Callable[..., Optional[List[Dict]]]] = None,
+        retriever: Optional[Callable[..., Optional[List[Union[Dict, str]]]]] = None,
         references_format: Literal["json", "yaml"] = "json",
         storage: Optional[Storage] = None,
         extra_data: Optional[Dict[str, Any]] = None,
@@ -349,6 +352,7 @@ class Agent:
         markdown: bool = False,
         add_name_to_instructions: bool = False,
         add_datetime_to_instructions: bool = False,
+        add_location_to_instructions: bool = False,
         timezone_identifier: Optional[str] = None,
         add_state_in_messages: bool = False,
         add_messages: Optional[List[Union[Dict, Message]]] = None,
@@ -444,6 +448,7 @@ class Agent:
         self.markdown = markdown
         self.add_name_to_instructions = add_name_to_instructions
         self.add_datetime_to_instructions = add_datetime_to_instructions
+        self.add_location_to_instructions = add_location_to_instructions
         self.timezone_identifier = timezone_identifier
         self.add_state_in_messages = add_state_in_messages
         self.add_messages = add_messages
@@ -3360,7 +3365,7 @@ class Agent:
                 )
 
             # Parse messages if provided
-            if messages is not None and len(messages) > 0:
+            if self.enable_user_memories and messages is not None and len(messages) > 0:
                 parsed_messages = []
                 for _im in messages:
                     if isinstance(_im, Message):
@@ -3415,7 +3420,7 @@ class Agent:
             )
 
         # Parse messages if provided
-        if messages is not None and len(messages) > 0:
+        if self.enable_user_memories and messages is not None and len(messages) > 0:
             parsed_messages = []
             for _im in messages:
                 if isinstance(_im, Message):
@@ -3552,84 +3557,84 @@ class Agent:
             session_id=session_id, async_mode=async_mode, user_id=user_id, knowledge_filters=knowledge_filters
         )
 
-        if self._tools_for_model is None:
-            self._tools_for_model = []
-            self._functions_for_model = {}
+        # We have to reset the tools every time because the tool factories produce new functions that is context aware that needs to be reset
+        self._tools_for_model = []
+        self._functions_for_model = {}
 
-            # Get Agent tools
-            if agent_tools is not None and len(agent_tools) > 0:
-                log_debug("Processing tools for model")
+        # Get Agent tools
+        if agent_tools is not None and len(agent_tools) > 0:
+            log_debug("Processing tools for model")
 
-                # Check if we need strict mode for the functions for the model
-                strict = False
-                if (
-                    self.response_model is not None
-                    and (self.structured_outputs or (not self.use_json_mode))
-                    and model.supports_native_structured_outputs
-                ):
-                    strict = True
+            # Check if we need strict mode for the functions for the model
+            strict = False
+            if (
+                self.response_model is not None
+                and (self.structured_outputs or (not self.use_json_mode))
+                and model.supports_native_structured_outputs
+            ):
+                strict = True
 
-                for tool in agent_tools:
-                    if isinstance(tool, Dict):
-                        # If a dict is passed, it is a builtin tool
-                        # that is run by the model provider and not the Agent
-                        self._tools_for_model.append(tool)
-                        log_debug(f"Included builtin tool {tool}")
+            for tool in agent_tools:
+                if isinstance(tool, Dict):
+                    # If a dict is passed, it is a builtin tool
+                    # that is run by the model provider and not the Agent
+                    self._tools_for_model.append(tool)
+                    log_debug(f"Included builtin tool {tool}")
 
-                    elif isinstance(tool, Toolkit):
-                        # For each function in the toolkit and process entrypoint
-                        for name, func in tool.functions.items():
-                            # If the function does not exist in self.functions
-                            if name not in self._functions_for_model:
-                                func._agent = self
-                                func.process_entrypoint(strict=strict)
-                                if strict and func.strict is None:
-                                    func.strict = True
-                                if self.tool_hooks is not None:
-                                    func.tool_hooks = self.tool_hooks
-                                self._functions_for_model[name] = func
-                                self._tools_for_model.append({"type": "function", "function": func.to_dict()})
-                                log_debug(f"Added tool {name} from {tool.name}")
-
-                        # Add instructions from the toolkit
-                        if tool.add_instructions and tool.instructions is not None:
-                            if self._tool_instructions is None:
-                                self._tool_instructions = []
-                            self._tool_instructions.append(tool.instructions)
-
-                    elif isinstance(tool, Function):
-                        if tool.name not in self._functions_for_model:
-                            tool._agent = self
-                            tool.process_entrypoint(strict=strict)
-                            if strict and tool.strict is None:
-                                tool.strict = True
+                elif isinstance(tool, Toolkit):
+                    # For each function in the toolkit and process entrypoint
+                    for name, func in tool.functions.items():
+                        # If the function does not exist in self.functions
+                        if name not in self._functions_for_model:
+                            func._agent = self
+                            func.process_entrypoint(strict=strict)
+                            if strict and func.strict is None:
+                                func.strict = True
                             if self.tool_hooks is not None:
-                                tool.tool_hooks = self.tool_hooks
-                            self._functions_for_model[tool.name] = tool
-                            self._tools_for_model.append({"type": "function", "function": tool.to_dict()})
-                            log_debug(f"Added tool {tool.name}")
+                                func.tool_hooks = self.tool_hooks
+                            self._functions_for_model[name] = func
+                            self._tools_for_model.append({"type": "function", "function": func.to_dict()})
+                            log_debug(f"Added tool {name} from {tool.name}")
 
-                        # Add instructions from the Function
-                        if tool.add_instructions and tool.instructions is not None:
-                            if self._tool_instructions is None:
-                                self._tool_instructions = []
-                            self._tool_instructions.append(tool.instructions)
+                    # Add instructions from the toolkit
+                    if tool.add_instructions and tool.instructions is not None:
+                        if self._tool_instructions is None:
+                            self._tool_instructions = []
+                        self._tool_instructions.append(tool.instructions)
 
-                    elif callable(tool):
-                        try:
-                            function_name = tool.__name__
-                            if function_name not in self._functions_for_model:
-                                func = Function.from_callable(tool, strict=strict)
-                                func._agent = self
-                                if strict:
-                                    func.strict = True
-                                if self.tool_hooks is not None:
-                                    func.tool_hooks = self.tool_hooks
-                                self._functions_for_model[func.name] = func
-                                self._tools_for_model.append({"type": "function", "function": func.to_dict()})
-                                log_debug(f"Added tool {func.name}")
-                        except Exception as e:
-                            log_warning(f"Could not add tool {tool}: {e}")
+                elif isinstance(tool, Function):
+                    if tool.name not in self._functions_for_model:
+                        tool._agent = self
+                        tool.process_entrypoint(strict=strict)
+                        if strict and tool.strict is None:
+                            tool.strict = True
+                        if self.tool_hooks is not None:
+                            tool.tool_hooks = self.tool_hooks
+                        self._functions_for_model[tool.name] = tool
+                        self._tools_for_model.append({"type": "function", "function": tool.to_dict()})
+                        log_debug(f"Added tool {tool.name}")
+
+                    # Add instructions from the Function
+                    if tool.add_instructions and tool.instructions is not None:
+                        if self._tool_instructions is None:
+                            self._tool_instructions = []
+                        self._tool_instructions.append(tool.instructions)
+
+                elif callable(tool):
+                    try:
+                        function_name = tool.__name__
+                        if function_name not in self._functions_for_model:
+                            func = Function.from_callable(tool, strict=strict)
+                            func._agent = self
+                            if strict:
+                                func.strict = True
+                            if self.tool_hooks is not None:
+                                func.tool_hooks = self.tool_hooks
+                            self._functions_for_model[func.name] = func
+                            self._tools_for_model.append({"type": "function", "function": func.to_dict()})
+                            log_debug(f"Added tool {func.name}")
+                    except Exception as e:
+                        log_warning(f"Could not add tool {tool}: {e}")
 
     def _model_should_return_structured_output(self):
         self.model = cast(Model, self.model)
@@ -4090,6 +4095,9 @@ class Agent:
 
     def format_message_with_state_variables(self, msg: Any) -> Any:
         """Format a message with the session state variables."""
+        import re
+        import string
+
         if not isinstance(msg, str):
             return msg
 
@@ -4100,7 +4108,21 @@ class Agent:
             self.extra_data or {},
             {"user_id": self.user_id} if self.user_id is not None else {},
         )
-        return self._formatter.format(msg, **format_variables)  # type: ignore
+        converted_msg = msg
+        for var_name in format_variables.keys():
+            # Only convert standalone {var_name} patterns, not nested ones
+            pattern = r"\{" + re.escape(var_name) + r"\}"
+            replacement = "${" + var_name + "}"
+            converted_msg = re.sub(pattern, replacement, converted_msg)
+
+        # Use Template to safely substitute variables
+        template = string.Template(converted_msg)
+        try:
+            result = template.safe_substitute(format_variables)
+            return result
+        except Exception as e:
+            log_warning(f"Template substitution failed: {e}")
+            return msg
 
     def get_system_message(self, session_id: str, user_id: Optional[str] = None) -> Optional[Message]:
         """Return the system message for the Agent.
@@ -4189,11 +4211,24 @@ class Agent:
             time = datetime.now(tz) if tz else datetime.now()
 
             additional_information.append(f"The current time is {time}.")
-        # 3.2.3 Add agent name if provided
+
+        # 3.2.3 Add the current location
+        if self.add_location_to_instructions:
+            from agno.utils.location import get_location
+
+            location = get_location()
+            if location:
+                location_str = ", ".join(
+                    filter(None, [location.get("city"), location.get("region"), location.get("country")])
+                )
+                if location_str:
+                    additional_information.append(f"Your approximate location is: {location_str}.")
+
+        # 3.2.4 Add agent name if provided
         if self.name is not None and self.add_name_to_instructions:
             additional_information.append(f"Your name is: {self.name}.")
 
-        # 3.2.4 Add information about agentic filters if enabled
+        # 3.2.5 Add information about agentic filters if enabled
         if self.knowledge is not None and self.enable_agentic_knowledge_filters:
             valid_filters = getattr(self.knowledge, "valid_metadata_filters", None)
             if valid_filters:
@@ -4424,23 +4459,26 @@ class Agent:
             else:
                 raise Exception("message must be a string or a callable when add_references is True")
 
-            retrieval_timer = Timer()
-            retrieval_timer.start()
-            docs_from_knowledge = self.get_relevant_docs_from_knowledge(
-                query=message_str, filters=knowledge_filters, **kwargs
-            )
-            if docs_from_knowledge is not None:
-                references = MessageReferences(
-                    query=message_str, references=docs_from_knowledge, time=round(retrieval_timer.elapsed, 4)
+            try:
+                retrieval_timer = Timer()
+                retrieval_timer.start()
+                docs_from_knowledge = self.get_relevant_docs_from_knowledge(
+                    query=message_str, filters=knowledge_filters, **kwargs
                 )
-                # Add the references to the run_response
-                if self.run_response.extra_data is None:
-                    self.run_response.extra_data = RunResponseExtraData()
-                if self.run_response.extra_data.references is None:
-                    self.run_response.extra_data.references = []
-                self.run_response.extra_data.references.append(references)
-            retrieval_timer.stop()
-            log_debug(f"Time to get references: {retrieval_timer.elapsed:.4f}s")
+                if docs_from_knowledge is not None:
+                    references = MessageReferences(
+                        query=message_str, references=docs_from_knowledge, time=round(retrieval_timer.elapsed, 4)
+                    )
+                    # Add the references to the run_response
+                    if self.run_response.extra_data is None:
+                        self.run_response.extra_data = RunResponseExtraData()
+                    if self.run_response.extra_data.references is None:
+                        self.run_response.extra_data.references = []
+                    self.run_response.extra_data.references.append(references)
+                retrieval_timer.stop()
+                log_debug(f"Time to get references: {retrieval_timer.elapsed:.4f}s")
+            except Exception as e:
+                log_warning(f"Failed to get references: {e}")
 
         # 1. If the user_message is provided, use that.
         if self.user_message is not None:
@@ -4807,7 +4845,7 @@ class Agent:
         )
 
         if response_format == {"type": "json_object"} and self.response_model is not None:
-            system_content += f"{get_json_output_prompt(self.response_model)}" # type: ignore
+            system_content += f"{get_json_output_prompt(self.response_model)}"  # type: ignore
 
         return [
             Message(role="system", content=system_content),
@@ -5048,7 +5086,7 @@ class Agent:
 
     def get_relevant_docs_from_knowledge(
         self, query: str, num_documents: Optional[int] = None, filters: Optional[Dict[str, Any]] = None, **kwargs
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> Optional[List[Union[Dict[str, Any], str]]]:
         """Get relevant docs from the knowledge base to answer a query.
 
         Args:
@@ -5091,7 +5129,7 @@ class Agent:
                 return self.retriever(**retriever_kwargs)
             except Exception as e:
                 log_warning(f"Retriever failed: {e}")
-                return None
+                raise e
 
         # Use knowledge base search
         try:
@@ -5116,11 +5154,11 @@ class Agent:
             return [doc.to_dict() for doc in relevant_docs]
         except Exception as e:
             log_warning(f"Error searching knowledge base: {e}")
-            return None
+            raise e
 
     async def aget_relevant_docs_from_knowledge(
         self, query: str, num_documents: Optional[int] = None, filters: Optional[Dict[str, Any]] = None, **kwargs
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> Optional[List[Union[Dict[str, Any], str]]]:
         """Get relevant documents from knowledge base asynchronously."""
         from agno.document import Document
 
@@ -5157,7 +5195,7 @@ class Agent:
                 return result
             except Exception as e:
                 log_warning(f"Retriever failed: {e}")
-                return None
+                raise e
 
         # Use knowledge base search
         try:
@@ -5182,9 +5220,9 @@ class Agent:
             return [doc.to_dict() for doc in relevant_docs]
         except Exception as e:
             log_warning(f"Error searching knowledge base: {e}")
-            return None
+            raise e
 
-    def convert_documents_to_string(self, docs: List[Dict[str, Any]]) -> str:
+    def convert_documents_to_string(self, docs: List[Union[Dict[str, Any], str]]) -> str:
         if docs is None or len(docs) == 0:
             return ""
 
@@ -5571,7 +5609,10 @@ class Agent:
             from agno.reasoning.openai import is_openai_reasoning_model
 
             reasoning_agent = self.reasoning_agent or get_reasoning_agent(
-                reasoning_model=reasoning_model, monitoring=self.monitoring
+                reasoning_model=reasoning_model,
+                monitoring=self.monitoring,
+                telemetry=self.telemetry,
+                debug_mode=self.debug_mode,
             )
             is_deepseek = is_deepseek_reasoning_model(reasoning_model)
             is_groq = is_groq_reasoning_model(reasoning_model)
@@ -5782,7 +5823,10 @@ class Agent:
             from agno.reasoning.openai import is_openai_reasoning_model
 
             reasoning_agent = self.reasoning_agent or get_reasoning_agent(
-                reasoning_model=reasoning_model, monitoring=self.monitoring
+                reasoning_model=reasoning_model,
+                monitoring=self.monitoring,
+                telemetry=self.telemetry,
+                debug_mode=self.debug_mode,
             )
             is_deepseek = is_deepseek_reasoning_model(reasoning_model)
             is_groq = is_groq_reasoning_model(reasoning_model)
@@ -7065,6 +7109,7 @@ class Agent:
                             border_style="yellow",
                         )
                         panels.append(tool_calls_panel)
+                        live_log.update(Group(*panels))
 
                     if len(_response_content) > 0:
                         render = True
